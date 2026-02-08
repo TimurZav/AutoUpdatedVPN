@@ -9,6 +9,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telebot.types import BotCommand
 from apscheduler.schedulers.background import BackgroundScheduler
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 
 load_dotenv()
@@ -183,12 +184,29 @@ class TelegramBotApp:
         self._register_handlers()
         self._register_jobs()
 
+    @staticmethod
+    def _is_authorized(chat_id: int) -> bool:
+        return str(chat_id) == str(CHAT_ID)
+
+    @staticmethod
+    def _build_start_keyboard() -> InlineKeyboardMarkup:
+        keyboard = InlineKeyboardMarkup(row_width=2)
+
+        keyboard.add(
+            InlineKeyboardButton("⏳ Статус", callback_data="status"),
+            InlineKeyboardButton("📤 Отправить", callback_data="send_now"),
+            InlineKeyboardButton("🔄 Проверить", callback_data="check"),
+        )
+
+        return keyboard
+
     def _register_commands(self) -> None:
         """Register visible bot commands in Telegram UI."""
         commands = [
             BotCommand("start", "Запустить бота"),
             BotCommand("status", "Показать статус документа"),
             BotCommand("send_now", "Принудительно отправить документ"),
+            BotCommand("check", "Проверка актуального документа"),
         ]
         self.bot.set_my_commands(commands)
 
@@ -206,43 +224,64 @@ class TelegramBotApp:
 
         @self.bot.message_handler(commands=["start"])
         def start(message):
-            self.bot.reply_to(
-                message,
-                "👋 Привет!\n"
-                "Я просматриваю VPN конфигурации на GitHub и отправляю его, когда они меняются.\n\n"
-                "/status — показать текучий статус",
+            text = (
+                "👋 Привет!\n\n"
+                "Я отслеживаю документ в GitHub и отправляю его, "
+                "если он изменился.\n\n"
+                "Выбери действие:"
+            )
+
+            self.bot.send_message(
+                message.chat.id,
+                text,
+                reply_markup=self._build_start_keyboard(),
             )
 
         @self.bot.message_handler(commands=["status"])
         def status(message):
             text = (
-                "📊 *Статус документа*\n\n"
-                f"🕒 Последняя проверка: `{self.state.last_check_at}`\n"
-                f"📤 Последняя отправка: `{self.state.last_send_at}`\n"
-                f"🔐 Хэш: `{self.state.last_hash}`"
+                "📊 Статус документа\n\n"
+                f"🕒 Последняя проверка: {self.state.last_check_at}\n"
+                f"📤 Последняя отправка: {self.state.last_send_at}\n"
+                f"🔐 Хэш: {self.state.last_hash}"
             )
-            self.bot.send_message(
-                message.chat.id,
-                text,
-                parse_mode="Markdown",
-            )
+
+            self.bot.reply_to(message, text)
 
         @self.bot.message_handler(commands=["send_now"])
         def send_now(message):
-            if str(message.chat.id) != str(CHAT_ID):
-                self.bot.reply_to(message, "⛔ Команда недоступна")
+            if not self._is_authorized(message.chat.id):
+                self.bot.answer_callback_query(message.id, "⛔ Нет доступа", show_alert=True)
                 return
 
-            self.bot.reply_to(message, "⏳ Отправляю документ...")
             try:
                 self.watcher.force_send()
-                self.bot.send_message(message.chat.id, "✅ Документ отправлен")
             except Exception as e:
                 logger.exception("Force send failed")
-                self.bot.send_message(
-                    message.chat.id,
-                    f"❌ Ошибка при отправке: {e}",
-                )
+                self.bot.reply_to(message, f"❌ Ошибка: {e}")
+
+        @self.bot.message_handler(commands=["check"])
+        def check(message):
+            if not self._is_authorized(message.chat.id):
+                self.bot.answer_callback_query(message.id, "⛔ Нет доступа", show_alert=True)
+                return
+
+            try:
+                self.watcher.check_and_send()
+                self.bot.reply_to(message, "✅ Проверка завершена")
+            except Exception as e:
+                logger.exception("Check failed")
+                self.bot.reply_to(message, f"❌ Ошибка: {e}")
+
+        @self.bot.callback_query_handler(func=lambda call: True)
+        def callback_handler(call: CallbackQuery):
+            data_actions: dict = {
+                'status': status,
+                'send_now': send_now,
+                'check': check
+            }
+            if call.data in data_actions:
+                data_actions[call.data](call.message)
 
     def run(self) -> None:
         """Start scheduler and run Telegram bot polling."""
