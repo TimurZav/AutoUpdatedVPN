@@ -1,108 +1,224 @@
 import os
+import json
+import telebot
+import hashlib
 import logging
 import requests
-import telebot
 from io import BytesIO
+from datetime import datetime
 from dotenv import load_dotenv
-from apscheduler.schedulers.blocking import BlockingScheduler
+from telebot.types import BotCommand
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# Загружаем переменные окружения
+
 load_dotenv()
 
-# Настройка логирования
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GITHUB_URL = os.getenv("GITHUB_URL")
+
+STATE_FILE = "state.json"
+DOCUMENT_NAME = "github_document.txt"
+
+if not all([BOT_TOKEN, CHAT_ID, GITHUB_URL]):
+    raise SystemExit("Environment variables are not fully defined")
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Получаем переменные окружения
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-GITHUB_URL = os.getenv('GITHUB_URL')
 
-# Проверяем наличие всех необходимых переменных
-if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, GITHUB_URL]):
-    logger.error("Не все переменные окружения установлены!")
-    logger.error(f"TELEGRAM_BOT_TOKEN: {'установлен' if TELEGRAM_BOT_TOKEN else 'отсутствует'}")
-    logger.error(f"TELEGRAM_CHAT_ID: {'установлен' if TELEGRAM_CHAT_ID else 'отсутствует'}")
-    logger.error(f"GITHUB_URL: {'установлен' if GITHUB_URL else 'отсутствует'}")
-    raise SystemExit("Ошибка: отсутствуют необходимые переменные окружения")
+class DocumentState:
+    """
+    Stores and persists document state between application restarts.
+
+    Keeps track of:
+    - last document check time
+    - last successful send time
+    - last document hash
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.last_check_at: str | None = None
+        self.last_send_at: str | None = None
+        self.last_hash: str | None = None
+        self.load()
+
+    def load(self) -> None:
+        """Load state from JSON file if it exists."""
+        if not os.path.exists(self.path):
+            return
+
+        with open(self.path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.last_check_at = data.get("last_check_at")
+        self.last_send_at = data.get("last_send_at")
+        self.last_hash = data.get("last_hash")
+
+    def save(self) -> None:
+        """Persist current state to JSON file."""
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "last_check_at": self.last_check_at,
+                    "last_send_at": self.last_send_at,
+                    "last_hash": self.last_hash,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
 
 
-def fetch_github_document():
-    """Получает содержимое документа из GitHub"""
-    try:
-        logger.info(f"Получаю документ из GitHub: {GITHUB_URL}")
-        response = requests.get(GITHUB_URL, timeout=30)
+class GitHubDocumentWatcher:
+    """
+    Responsible for fetching a document from GitHub,
+    detecting changes and sending updates to Telegram.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        bot: telebot.TeleBot,
+        chat_id: str,
+        state: DocumentState,
+    ):
+        self.url = url
+        self.bot = bot
+        self.chat_id = chat_id
+        self.state = state
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _hash(content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def fetch(self) -> str:
+        """Download document content from GitHub."""
+        logger.info("Fetching document from GitHub")
+        response = requests.get(self.url, timeout=30)
         response.raise_for_status()
-        logger.info("Документ успешно получен из GitHub")
         return response.text
-    except requests.exceptions.RequestException as err:
-        logger.error(f"Ошибка при получении документа из GitHub: {err}")
-        raise
+
+    def send(self, content: str) -> None:
+        """Send document to Telegram chat."""
+        file = BytesIO(content.encode("utf-8"))
+        file.name = DOCUMENT_NAME
+
+        self.bot.send_document(
+            chat_id=self.chat_id,
+            document=file,
+            caption="📄 Документ обновлен",
+        )
+
+    def check_and_send(self) -> None:
+        """
+        Check document for changes and send it to Telegram
+        only if the content has changed.
+        """
+        logger.info("Checking document")
+
+        self.state.last_check_at = self._now()
+
+        content = self.fetch()
+        current_hash = self._hash(content)
+
+        if current_hash == self.state.last_hash:
+            logger.info("Document has not changed")
+            self.state.save()
+            return
+
+        self.send(content)
+
+        self.state.last_hash = current_hash
+        self.state.last_send_at = self._now()
+        self.state.save()
+
+        logger.info("Document sent")
 
 
-def send_to_telegram(content):
-    """Отправляет содержимое в Telegram"""
-    try:
-        bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+class TelegramBotApp:
+    """
+    Application entrypoint that wires together:
+    - Telegram bot
+    - Scheduler
+    - Document watcher
+    """
 
-        # Если содержимое слишком большое, отправляем файлом
-        max_message_length = 4096
-        if len(content) <= max_message_length:
-            bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=content
+    def __init__(self):
+        self.bot = telebot.TeleBot(BOT_TOKEN)
+        self.state = DocumentState(STATE_FILE)
+        self.watcher = GitHubDocumentWatcher(
+            GITHUB_URL,
+            self.bot,
+            CHAT_ID,
+            self.state,
+        )
+        self.scheduler = BackgroundScheduler()
+
+        self._register_commands()
+        self._register_handlers()
+        self._register_jobs()
+
+    def _register_commands(self) -> None:
+        """Register visible bot commands in Telegram UI."""
+        commands = [
+            BotCommand("start", "Запустить бота"),
+            BotCommand("status", "Показать статус документа"),
+        ]
+        self.bot.set_my_commands(commands)
+
+    def _register_jobs(self) -> None:
+        """Register scheduled jobs."""
+        self.scheduler.add_job(
+            self.watcher.check_and_send,
+            trigger="cron",
+            hour=18,
+            minute=0,
+        )
+
+    def _register_handlers(self) -> None:
+        """Register Telegram bot command handlers."""
+
+        @self.bot.message_handler(commands=["start"])
+        def start(message):
+            self.bot.reply_to(
+                message,
+                "👋 Привет!\n"
+                "Я просматриваю VPN конфигурации на GitHub и отправляю его, когда они меняются.\n\n"
+                "/status — показать текучий статус",
             )
-            logger.info("Сообщение успешно отправлено в Telegram")
-        else:
-            # Отправляем как файл, если текст слишком длинный
-            logger.info("Содержимое слишком большое, отправляю как файл")
-            file = BytesIO(content.encode('utf-8'))
-            file.name = 'github_document.txt'
-            bot.send_document(
-                chat_id=TELEGRAM_CHAT_ID,
-                document=file,
-                caption='Документ из GitHub'
+
+        @self.bot.message_handler(commands=["status"])
+        def status(message):
+            text = (
+                "📊 *Статус документа*\n\n"
+                f"🕒 Последняя проверка: `{self.state.last_check_at}`\n"
+                f"📤 Последняя отправка: `{self.state.last_send_at}`\n"
+                f"🔐 Хэш: `{self.state.last_hash}`"
             )
-            logger.info("Файл успешно отправлен в Telegram")
+            self.bot.send_message(
+                message.chat.id,
+                text,
+                parse_mode="Markdown",
+            )
 
-    except Exception as err:
-        logger.error(f"Ошибка при отправке в Telegram: {err}")
-        raise
+    def run(self) -> None:
+        """Start scheduler and run Telegram bot polling."""
+        logger.info("Starting scheduler")
+        self.scheduler.start()
 
-
-def scheduled_job():
-    """Задача, которая выполняется по расписанию"""
-    logger.info("Запуск запланированной задачи")
-    try:
-        content = fetch_github_document()
-        send_to_telegram(content)
-        logger.info("Задача выполнена успешно")
-    except Exception as e:
-        logger.error(f"Ошибка при выполнении задачи: {e}")
-
-
-def main():
-    """Главная функция"""
-    logger.info("Запуск приложения")
-    logger.info(f"Документ будет отправляться каждый день в 18:00 по местному времени")
-
-    # Создаем планировщик
-    scheduler = BlockingScheduler()
-
-    # Добавляем задачу на выполнение каждый день в 18:00
-    scheduler.add_job(scheduled_job, 'cron', hour=18, minute=0)
-
-    logger.info("Планировщик настроен. Ожидаю выполнения задач...")
-
-    try:
-        # Запускаем планировщик
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Приложение остановлено")
+        logger.info("Starting bot polling")
+        self.bot.infinity_polling()
 
 
 if __name__ == "__main__":
-    main()
+    TelegramBotApp().run()
