@@ -144,6 +144,21 @@ class GitHubDocumentWatcher:
 
         logger.info("Document sent")
 
+    def force_send(self) -> None:
+        """
+        Force document sending without checking for changes.
+        """
+        logger.info("Force sending document")
+
+        self.state.last_check_at = self._now()
+
+        content = self.fetch()
+        self.send(content)
+
+        self.state.last_hash = self._hash(content)
+        self.state.last_send_at = self._now()
+        self.state.save()
+
 
 class TelegramBotApp:
     """
@@ -173,6 +188,7 @@ class TelegramBotApp:
         commands = [
             BotCommand("start", "Запустить бота"),
             BotCommand("status", "Показать статус документа"),
+            BotCommand("send_now", "Принудительно отправить документ"),
         ]
         self.bot.set_my_commands(commands)
 
@@ -210,6 +226,23 @@ class TelegramBotApp:
                 text,
                 parse_mode="Markdown",
             )
+
+        @self.bot.message_handler(commands=["send_now"])
+        def send_now(message):
+            if str(message.chat.id) != str(CHAT_ID):
+                self.bot.reply_to(message, "⛔ Команда недоступна")
+                return
+
+            self.bot.reply_to(message, "⏳ Отправляю документ...")
+            try:
+                self.watcher.force_send()
+                self.bot.send_message(message.chat.id, "✅ Документ отправлен")
+            except Exception as e:
+                logger.exception("Force send failed")
+                self.bot.send_message(
+                    message.chat.id,
+                    f"❌ Ошибка при отправке: {e}",
+                )
 
     def run(self) -> None:
         """Start scheduler and run Telegram bot polling."""
