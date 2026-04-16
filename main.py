@@ -5,7 +5,6 @@ import hashlib
 import logging
 import requests
 from io import BytesIO
-from typing import Optional
 from datetime import datetime
 from dotenv import load_dotenv
 from telebot.types import BotCommand
