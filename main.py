@@ -215,7 +215,7 @@ class TelegramBotApp:
         self.scheduler.add_job(
             self.watcher.check_and_send,
             trigger="cron",
-            hour='18-00',
+            hour='18-23',
             minute=0,
         )
 
