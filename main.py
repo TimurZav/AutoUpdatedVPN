@@ -5,6 +5,7 @@ import hashlib
 import logging
 import requests
 from io import BytesIO
+from typing import Optional
 from datetime import datetime
 from dotenv import load_dotenv
 from telebot.types import BotCommand
@@ -14,12 +15,12 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GITHUB_URL = os.getenv("GITHUB_URL")
+BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+GITHUB_URL: str = os.getenv("GITHUB_URL", "")
 
-STATE_FILE = "state.json"
-DOCUMENT_NAME = "github_document.txt"
+STATE_FILE: str = "state.json"
+DOCUMENT_NAME: str = "github_document.txt"
 
 if not all([BOT_TOKEN, CHAT_ID, GITHUB_URL]):
     raise SystemExit("Environment variables are not fully defined")
